@@ -94,25 +94,6 @@ def get_unique_id_from_dev_path(dev_path):
     # it is removing "/dev/disk/by-id/scsi-" from dev_path
     return dev_path[21:]
 
-def sanitise_name(dbg, name):
-    sanitised = ""
-    for c in name:
-        if c == os.sep or c in [
-                "<",
-                ">",
-                ":",
-                "\"",
-                "/",
-                "|",
-                "?",
-                "*"]:
-            sanitised = sanitised + "_"
-        else:
-            sanitised = sanitised + c
-    if sanitised == "":
-        sanitised = "unknown"
-    return sanitised
-
 def mount(dbg, dev_path):
     # FIXME: Ensure corosync+dlm are configured and running
 

@@ -1,12 +1,14 @@
 #!/usr/bin/env python
 
-import os, sys
+import os
 import time
-from xapi.storage import log
-import xml.dom.minidom
 import fcntl
 import errno
 import subprocess
+import shutil
+import string
+
+from xapi.storage import log
 
 RETRY_MAX = 20 # retries
 RETRY_PERIOD = 1.0 # seconds
@@ -86,3 +88,90 @@ def get_current_host():
     session.xenapi.login_with_password("root", "")
     this_host = session.xenapi.host.get_by_uuid(inventory.get("INSTALLATION_UUID"))
     return session.xenapi.host.get_name_label(this_host)
+
+def index(iterable, entry, instance=1):
+    """Get index of 'entry' in 'iterable'.
+
+    Args:
+        iterable (...): any object that implements the 'index'
+            method
+        entry (...): entry to search in 'iterable'
+        instance (int): instance of 'entry' to find the index of
+            If negative, start from the end.
+            (Default: 1)
+
+    Returns:
+        (int) 'instance'th index of 'entry' in 'iterable'
+
+    Raises:
+        AttributeError
+        ValueError
+        TypeError
+    """
+    if instance < 0:
+        entry_count = iterable.count(entry)
+        tmp = entry_count + instance + 1
+
+        if tmp < 1:
+            raise ValueError(
+                "|instance| = {} > {} = iterable.count(entry)".format(
+                    -instance,
+                    entry_count
+                )
+            )
+
+        instance = tmp
+    elif instance == 0:
+        raise ValueError("'instance' must be different from 0")
+
+    idx = 0
+    for i in xrange(instance):
+        try:
+            idx += iterable[idx:].index(entry) + 1
+        except ValueError:
+            raise ValueError("'{}' appears {} times in list".format(entry, i))
+
+    return idx - 1
+
+def remove_path(path, force=False):
+    """Removes filesystem entry.
+
+    Args:
+        path (str): path to file or directory
+
+    Raises:
+        ValueError
+        OSError
+    """
+    try:
+        os.unlink(path)
+    except OSError as exc:
+        if exc.errno == errno.ENOENT:
+            if not force:
+                raise
+        elif exc.errno == errno.EISDIR:
+            shutil.rmtree(path)
+        else:
+            raise
+
+def sanitise_name(name):
+    """Returns filesystem friendly 'name'.
+
+    Invalid characters will be replaced with the underscore character.
+
+    Args:
+        name (str): name to sanitize
+
+    Returns:
+        (str) composed only of valid characters
+    """
+    allowed_chars = ''.join([string.ascii_letters, string.digits, '-._'])
+
+    char_list = []
+    for c in name:
+        if c in allowed_chars:
+            char_list.append(c)
+        else:
+            char_list.append('_')
+
+    return ''.join(char_list)
