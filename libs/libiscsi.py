@@ -1,22 +1,20 @@
-import uuid
-import sqlite3
-import os, sys
+import os
 import time
 import urlparse
 import stat
 from xapi.storage.common import call
 from xapi.storage import log
-import xapi.storage.libs.poolhelper
 import xcp.environ
 import XenAPI
-import socket
 import scsiutil
-import fcntl
+
 from xapi.storage.libs import util
+from xapi.storage.libs.refcounter import RefCounter
 
 DEFAULT_PORT = 3260
 ISCSI_REFDIR = '/var/run/sr-ref'
 DEV_PATH_ROOT = '/dev/disk/by-id/scsi-'
+ISCSIADM_BIN = '/usr/sbin/iscsiadm'
 
 def queryLUN(dbg, path, id):
     vendor = scsiutil.getmanufacturer(dbg, path)
@@ -56,30 +54,30 @@ def parse_node_output(text):
 
 
 def discoverIQN(dbg, keys, interfaceArray=["default"]):
-    """Run iscsiadm in discovery mode to obtain a list of the 
+    """Run iscsiadm in discovery mode to obtain a list of the
     TargetIQNs available on the specified target and port. Returns
     a list of triples - the portal (ip:port), the tpgt (target portal
     group tag) and the target name"""
 
-    #FIXME: Important: protect against resetting boot disks on the same 
+    #FIXME: Important: protect against resetting boot disks on the same
     # target
-        
+
     cmd_base = ["-t", "st", "-p", keys['target']]
     for interface in interfaceArray:
         cmd_base.append("-I")
         cmd_base.append(interface)
-    cmd_disc = ["iscsiadm", "-m", "discovery"] + cmd_base
-    cmd_discdb = ["iscsiadm", "-m", "discoverydb"] + cmd_base
+    cmd_disc = [ISCSIADM_BIN, '-m', 'discovery'] + cmd_base
+    cmd_discdb = [ISCSIADM_BIN, '-m', 'discoverydb'] + cmd_base
     auth_args =  ["-n", "discovery.sendtargets.auth.authmethod", "-v", "CHAP",
                   "-n", "discovery.sendtargets.auth.username", "-v", keys['username'],
                   "-n", "discovery.sendtargets.auth.password", "-v", keys['password']]
     fail_msg = "Discovery failed. Check target settings and " \
                "username/password (if applicable)"
-    try:    
+    try:
         if keys['username'] != None:
             # Unfortunately older version of iscsiadm won't fail on new modes
             # it doesn't recognize (rc=0), so we have to test it out
-            support_discdb = "discoverydb" in util.pread2(["iscsiadm", "-h"])
+            support_discdb = 'discoverydb' in util.pread2([ISCSIADM_BIN, '-h'])
             if support_discdb:
                 exn_on_failure(cmd_discdb + ["-o", "new"], fail_msg)
                 exn_on_failure(cmd_discdb + ["-o", "update"] + auth_args, fail_msg)
@@ -97,21 +95,43 @@ def discoverIQN(dbg, keys, interfaceArray=["default"]):
 
 
 def set_chap_settings(dbg, portal, target, username, password):
-    cmd = ["/usr/sbin/iscsiadm", "-m", "node", "-T", iqn, "--portal", 
-           portal, "--op", "update", "-n", "node.session.auth.authmethod", 
-           "-v", "CHAP"]
+    cmd = [
+        ISCSIADM_BIN,
+        '-m', 'node',
+        '-T', iqn,
+        '--portal', portal,
+        '--op', 'update',
+        '-n', 'node.session.auth.authmethod',
+        '-v', 'CHAP'
+    ]
     output = call(dbg, cmd)
-    log.debug("%s: output = %s" % (dbg, output))
-    cmd = ["/usr/sbin/iscsiadm", "-m", "node", "-T", iqn, "--portal", 
-           portal, "--op", "update", "-n", "node.session.auth.username", 
-           "-v", username]
+    log.debug("{}: output = {}".format(dbg, output))
+
+    cmd = [
+        ISCSIADM_BIN,
+        "-m", "node",
+        "-T", iqn,
+        "--portal", portal,
+        "--op", "update",
+        "-n", "node.session.auth.username",
+        "-v", username
+    ]
     output = call(dbg, cmd)
-    log.debug("%s: output = %s" % (dbg, output))
-    cmd = ["/usr/sbin/iscsiadm", "-m", "node", "-T", iqn, "--portal", 
-           portal, "--op", "update", "-n", "node.session.auth.password", 
-           "-v", password]
+    log.debug("{}: output = {}".format(dbg, output))
+
+    cmd = [
+        ISCSIADM_BIN,
+        "-m", "node",
+        "-T", iqn,
+        "--portal", portal,
+        "--op",
+        "update",
+        "-n",
+        "node.session.auth.password",
+        "-v", password]
     output = call(dbg, cmd)
-    log.debug("%s: output = %s" % (dbg, output))
+    log.debug("{}: output = {}".format(dbg, output))
+
 
 
 def get_device_path(dbg, uri):
@@ -122,89 +142,94 @@ def get_device_path(dbg, uri):
 
 def login(dbg, ref_str, keys):
     iqn_map = discoverIQN(dbg, keys)
-    output = iqn_map[0] 
-    # FIXME: only take the first one returned. 
+    output = iqn_map[0]
+    # FIXME: only take the first one returned.
     # This might not always be the one we want.
-    log.debug("%s: output = %s" % (dbg, output))
+    log.debug("{}: output = {}".format(dbg, output))
     portal = output[0]
     # FIXME: error handling
 
-   # Provide authentication details if necessary
-    if keys['username'] != None:
-        set_chap_settings(dbg, portal, keys['target'], 
-                          keys['username'], keys['password'])
+    # Provide authentication details if necessary
+    if keys['username'] is not None:
+        set_chap_settings(
+            dbg,
+            portal,
+            keys['target'],
+            keys['username'],
+            keys['password']
+        )
 
-    # Lock refcount file before login
-    if not os.path.exists(ISCSI_REFDIR):
-        os.mkdir(ISCSI_REFDIR)
-    filename = os.path.join(ISCSI_REFDIR, keys['iqn'])
+    with RefCounter(os.path.join('iscsi', keys['iqn'])) as rc:
+        current_sessions = get_sessions(dbg)
+        log.debug(
+            "{}: current iSCSI sessions are {}".format(dbg, current_sessions)
+        )
 
-    f = util.lock_file(dbg, filename, "a+")
+        session_id = find_session(
+            dbg,
+            portal,
+            keys['iqn'],
+            current_sessions
+        )
 
-    current_sessions = listSessions(dbg)
-    log.debug("%s: current iSCSI sessions are %s" % (dbg, current_sessions))
-    sessionid = findMatchingSession(dbg, portal, keys['iqn'], current_sessions)
-    if sessionid:
-        # If there's an existing session, rescan it 
-        # in case new LUNs have appeared in it
-        log.debug("%s: rescanning session %d for %s on %s" % 
-                   (dbg, sessionid, keys['iqn'], keys['target']))
-        rescanSession(dbg, sessionid)
-    else:
-        # Otherwise, perform a fresh login
-        cmd = ["/usr/sbin/iscsiadm", "-m", "node", "-T", keys['iqn'], 
-               "--portal", portal, "-l"]
-        output = call(dbg, cmd)
-        log.debug("%s: output = %s" % (dbg, output))
-        # FIXME: check for success
+        if session_id is not None:
+            # If there's an existing session, rescan it
+            # in case new LUNs have appeared in it
+            log.debug(
+                "{}: rescanning session {} for {} on {}".format(
+                    dbg,
+                    session_id,
+                    keys['iqn'],
+                    keys['target']
+                )
+            )
 
-   # Increment refcount
-    found = False
-    for line in f.readlines():
-        if line.find(ref_str) != -1:
-            found = True
-    if not found:
-        f.write("%s\n" % ref_str)
+            rescan_session(dbg, session_id)
 
-    util.unlock_file(dbg, f)
+            if rc.get_count() == 0:
+                log.debug(
+                    "{}: WARNING - Session already started, "
+                    "but RefCount is 0.".format(dbg)
+                )
+        else:
+            # Otherwise, perform a fresh login
+            cmd = [
+                ISCSIADM_BIN,
+                '-m', 'node',
+                '-T', keys['iqn'],
+                '--portal', portal,
+                '-l'
+            ]
+
+            if rc.get_count() > 0:
+                log.debug(
+                    "{}: WARNING - No active sessions, "
+                    "but RefCount = {}.".format(dbg, rc.get_count())
+                )
+
+            output = call(dbg, cmd)
+            log.debug("{}: output = {}".format(dbg, output))
+            # FIXME: check for success
+
+        rc.increment(ref_str)
 
     waitForDevice(dbg, keys)
 
     # Return path to logged in target
-    target_path = "/dev/iscsi/%s/%s" % (keys['iqn'], portal)
-    return target_path
-
+    return os.path.join('/dev/iscsi', keys['iqn'], portal)
 
 def logout(dbg, ref_str, iqn):
-    filename = os.path.join(ISCSI_REFDIR, iqn)
-    if not os.path.exists(filename):
-        return 
-
-    f = util.lock_file(dbg, filename, "r+")
-
-    refcount = 0
-    file_content = f.readlines()
-    f.seek(0,0)
-    for line in file_content:
-        if line.find(ref_str) == -1:
-            f.write(line)
-            refcount += 1
-    f.truncate()
-
-    if not refcount:
-        os.unlink(filename)
-        cmd = ["/usr/sbin/iscsiadm", "-m", "node", "-T", iqn, "-u"]
-        call(dbg, cmd)
-
-    util.unlock_file(dbg, f)
-        
+    cmd = [ISCSIADM_BIN, '-m', 'node', '-T', iqn, '-u']
+    with RefCounter(os.path.join('iscsi', iqn)) as rc:
+        if rc.get_count() == 1 and rc.decrement(ref_str) == 0:
+            call(dbg, cmd)
 
 def waitForDevice(dbg, keys):
     # Wait for new device(s) to appear
     cmd = ["/usr/sbin/udevadm", "settle"]
     call(dbg, cmd)
 
-    # FIXME: For some reason, udevadm settle isn't sufficient 
+    # FIXME: For some reason, udevadm settle isn't sufficient
     # to ensure the device is present. Why not?
     for i in range(1,10):
         time.sleep(1)
@@ -215,37 +240,40 @@ def waitForDevice(dbg, keys):
             except:
                 log.debug("%s: Waiting for device to appear" % dbg)
 
-def listSessions(dbg):
-    '''Return a list of (sessionid, portal, targetIQN) pairs 
-       representing logged-in iSCSI sessions.'''
-    cmd = ["/usr/sbin/iscsiadm", "-m", "session"]
-    output = call(dbg, cmd, error=False)  
+def get_sessions(dbg):
+    """Get active iscsi sessions.
+
+    Returns:
+        [(int, str, str), ...]
+        list of tuples of the format (session_id, portal, target_iqn)
+    """
+    cmd = [ISCSIADM_BIN, '-m', 'session']
+    output = call(dbg, cmd, error=False)
     # if there are none, this command exits with rc 21
-    # e.g. "tcp: [1] 10.71.153.28:3260,1 iqn.2009-01.xenrt.test:iscsi6da966ca 
+    # e.g. "tcp: [1] 10.71.153.28:3260,1 iqn.2009-01.xenrt.test:iscsi6da966ca
     # (non-flash)"
-    return [tuple([int(x.split(' ')[1].strip('[]')), x.split(' ')[2], 
+    return [tuple([int(x.split(' ')[1].strip('[]')), x.split(' ')[2],
             x.split(' ')[3]]) for x in output.split('\n') if x <> '']
 
 
-def findMatchingSession(dbg, new_target, iqn, sessions):
-    for (sessionid, portal, targetiqn) in sessions:
-        # FIXME: only match on target IP address and IQN for now 
+def find_session(dbg, new_target, iqn, sessions):
+    for (session_id, portal, targetiqn) in sessions:
+        # FIXME: only match on target IP address and IQN for now
         # (not target port number)
         if portal.split(',')[0] == new_target and targetiqn == iqn:
-            return sessionid
+            return session_id
     return None
 
 
-def rescanSession(dbg, sessionid):
-    cmd = ["/usr/sbin/iscsiadm", "-m", "session", "-r", str(sessionid), 
-           "--rescan"]
+def rescan_session(dbg, session_id):
+    cmd = [ISCSIADM_BIN, '-m', 'session', '-r', str(session_id), '--rescan']
     output = call(dbg, cmd)
     log.debug("%s: output = '%s'" % (dbg, output))
     # FIXME: check for success
 
 
 def getDesiredInitiatorName(dbg):
-    # FIXME: for now, get this from xapi. In future, xapi will 
+    # FIXME: for now, get this from xapi. In future, xapi will
     # write this to a file we can read from.
     inventory = xcp.environ.readInventory()
     session = XenAPI.xapi_local()
@@ -273,19 +301,19 @@ def restartISCSIDaemon(dbg):
     cmd = ["/usr/bin/systemctl", "restart", "iscsid"]
     call(dbg, cmd)
 
- 
+
 def isISCSIDaemonRunning(dbg):
     cmd = ["/usr/bin/systemctl", "status", "iscsid"]
     (stdout, stderr, rc) = call(dbg, cmd, error=False, simple=False)
     return rc == 0
 
- 
+
 def configureISCSIDaemon(dbg):
     # Find out what the user wants the IQN to be
     iqn = getCurrentInitiatorName(dbg)
     if iqn == None:
         iqn = getDesiredInitiatorName(dbg)
- 
+
     # Make that the IQN, if possible
     if not isISCSIDaemonRunning(dbg):
         setInitiatorName(dbg, iqn)
@@ -293,7 +321,7 @@ def configureISCSIDaemon(dbg):
     else:
         cur_iqn = getCurrentInitiatorName(dbg)
         if iqn != cur_iqn:
-            if len(listSessions(dbg)) > 0:
+            if len(get_sessions(dbg)) > 0:
                 raise xapi.storage.api.volume.Unimplemented(
                       "Daemon running with sessions from IQN '%s', "
                       "desired IQN '%s'" % (cur_iqn, iqn))
@@ -316,13 +344,13 @@ def decomposeISCSIuri(dbg, uri):
            'password': None
     }
 
-    if uri.netloc:  
+    if uri.netloc:
     	keys['target'] = uri.netloc
     if uri.path and '/' in uri.path:
         tokens = uri.path.split("/")
         if tokens[1] != '':
             keys['iqn'] = tokens[1]
-        if len(tokens) > 2 and tokens[2] != '': 
+        if len(tokens) > 2 and tokens[2] != '':
             keys['scsiid'] = tokens[2]
 
     # If there's authentication required, the target will be i
@@ -346,17 +374,17 @@ def zoneInLUN(dbg, uri):
             raise xapi.storage.api.volume.SR_does_not_exist(
                   "The SR URI is invalid; please use \
                    iscsi://<target>/<targetIQN>/<lun>")
-        log.debug("%s: target = '%s', iqn = '%s', scsiid = '%s'" % 
+        log.debug("%s: target = '%s', iqn = '%s', scsiid = '%s'" %
                   (dbg, keys['target'], keys['iqn'], keys['scsiid']))
 
 
         usechap = False
-        if keys['username'] != None: 
+        if keys['username'] != None:
             usechap = True
 
         configureISCSIDaemon(dbg)
 
-        log.debug("%s: logging into %s on %s" % 
+        log.debug("%s: logging into %s on %s" %
                   (dbg, keys['iqn'], keys['target']))
         login(dbg, uri, keys)
 
