@@ -51,13 +51,27 @@ class VHDUtil(object):
         return call(dbg, cmd)
 
     @staticmethod
-    def snapshot(dbg, vol_path, snap_path):
+    def snapshot(dbg, new_vhd_path, parent_vhd_path, force_parent_link):
+        """Perform VHD snapshot.
+
+        Args:
+            new_vhd_path: (str) Absolute path to the VHD that will
+                be created
+            parent_vhd_path: (str) Absolute path to the existing VHD
+                we wish to snapshot
+            force_parent_link: (bool) If 'True', link new VHD to
+                the parent VHD, even if the parent is empty
+        """
         cmd = [
             VHD_UTIL_BIN, 'snapshot',
-            '-n', snap_path,
-            '-p', vol_path,
+            '-n', new_vhd_path,
+            '-p', parent_vhd_path,
             '-S', str(MSIZE_MIB)
         ]
+
+        if force_parent_link:
+            cmd.append('-e')
+
         return call(dbg, cmd)
 
     @staticmethod

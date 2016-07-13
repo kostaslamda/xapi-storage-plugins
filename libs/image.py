@@ -1,8 +1,8 @@
-import os
+from __future__ import absolute_import
 import os.path
 
 
-class Path:
+class Path(object):
 
     """An entity on the filesystem"""
 

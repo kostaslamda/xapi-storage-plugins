@@ -1,14 +1,16 @@
 import os
 import signal
+import errno
+import uuid
 
 # from python-fdsend
 # import fdsend
 
+# TODO: Get rid of 'image' module
 import image
 from xapi.storage.libs.util import call
 from xapi.storage import log
-import pickle
-import urlparse
+import cPickle
 
 # Use Xen tapdisk to create block devices from files
 
@@ -20,14 +22,18 @@ nbdserver_prefix = "/var/run/blktap-control/nbdserver"
 TD_PROC_METADATA_DIR = "/var/run/nonpersistent/dp-tapdisk"
 TD_PROC_METADATA_FILE = "meta.pickle"
 
+IMAGE_TYPES = frozenset(['vhd', 'aio'])
 
-class Tapdisk:
+class Tapdisk(object):
 
     def __init__(self, minor, pid, f):
         self.minor = minor
         self.pid = pid
         self.f = f
         self.secondary = None  # mirror destination
+        self.type = None
+        self.file_path = None
+        self.uuid = str(uuid.uuid4())
 
     def __repr__(self):
         return "Tapdisk(%s, %s, %s)" % (self.minor, self.pid, self.f)
@@ -60,6 +66,55 @@ class Tapdisk:
             args.append("-D")
         call(dbg, args)
         self.f = f
+
+
+    # More flexible open
+    def open_2(self, dbg, type_, file_path, options):
+        #pid, minor, _type, _file, options
+        assert type_ in IMAGE_TYPES
+        self.type_file = ':'.join([type_, os.path.realpath(file_path)])
+
+        cmd = [
+            'tap-ctl', 'open',
+            '-m', str(self.minor),
+            '-p', str(self.pid),
+            '-a', self.type_file
+        ]
+
+        if 'readonly' in options and options['readonly']:
+            cmd.append('-R')
+
+        if 'leaf_cache' in options and options['leaf_cache']:
+            cmd.append('-r')
+
+        if ('existing_parent' in options and
+                options['existing_parent'] is not None):
+            cmd.append('-e')
+            cmd.append(str(options['existing_parent']))
+
+        if ('secondary' in options and
+                'type' in options['secondary'] and
+                'file_path' in options['secondary']):
+            assert options['secondary']['type'] in IMAGE_TYPES
+            cmd.append('-2')
+            cmd.append(
+                ':'.join([
+                    options['secondary']['type'],
+                    os.path.realpath(options['secondary']['file_path'])
+                ])
+            )
+
+        if 'standby' in options and options['standby']:
+            cmd.append('-s')
+
+        if 'timeout' in options and options['timeout'] is not None:
+            cmd.append('-t')
+            cmd.append(str(options['timeout']))
+
+        if 'o_direct' in options and options['o_direct'] == False:
+            cmd.append('-D')
+
+        call(dbg, cmd)
 
     def pause(self, dbg):
         call(dbg,
@@ -127,6 +182,33 @@ def create(dbg):
     call(dbg, ["tap-ctl", "attach", "-m", str(minor), "-p", str(pid)])
     return Tapdisk(minor, pid, None)
 
+def find(minor=None, pid=None, type_=None, file_path=None):
+    """Find tapdisks that satisfy the parameters.
+
+    Args:
+        minor: (str|int) minor number
+        pid: (str|int) pid number
+        type_: (str) 'vhd' or 'aio'
+        file_path: (str) file path
+
+    Return:
+        (list[Tapdisk()]) list of initialized Tapdisk objects
+    """
+    tapdisk_object_list = []
+
+    for tapdisk_dict in TapCtl.list(minor, pid, type_, file_path):
+        tapdisk_object_list.append(
+            Tapdisk(
+                tapdisk_dict['minor'],
+                tapdisk_dict['pid'],
+                None
+            )
+        )
+
+        tapdisk_object_list[-1].type = tapdisk_dict['type']
+        tapdisk_object_list[-1].file_path = tapdisk_dict['file_path']
+
+    return tapdisk_object_list
 
 def find_by_file(dbg, f):
     log.debug("%s: find_by_file f=%s" % (dbg, f))
@@ -151,10 +233,10 @@ def save_tapdisk_metadata(dbg, path, tap):
     try:
         os.makedirs(dirname, mode=0755)
     except OSError as e:
-        if e.errno != 17:  # 17 == EEXIST, which is harmless
-            raise e
+        if e.errno != errno.EEXIST:
+            raise
     with open(dirname + "/" + TD_PROC_METADATA_FILE, "w") as fd:
-        pickle.dump(tap.__dict__, fd)
+        cPickle.dump(tap.__dict__, fd)
 
 def load_tapdisk_metadata(dbg, path):
     """Recover the tapdisk metadata for this VDI from host-local
@@ -162,15 +244,19 @@ def load_tapdisk_metadata(dbg, path):
     dirname = _metadata_dir(path)
     log.debug("%s: load_tapdisk_metadata: trying '%s'" % (dbg, dirname))
     filename = dirname + "/" + TD_PROC_METADATA_FILE
-    if not(os.path.exists(filename)):
-        # XXX throw a better exception
-        raise Exception('volume doesn\'t exist')
-        #raise xapi.storage.api.volume.Volume_does_not_exist(dirname)
+    # No need to check for file existence;
+    # if file not there, IOError is raised
+    #if not(os.path.exists(filename)):
+    #    raise Exception('volume doesn\'t exist')
+    #    #raise xapi.storage.api.volume.Volume_does_not_exist(dirname)
     with open(filename, "r") as fd:
-        meta = pickle.load(fd)
+        meta = cPickle.load(fd)
         tap = Tapdisk(meta['minor'], meta['pid'], meta['f'])
         tap.secondary = meta['secondary']
-        return tap
+        tap.type = meta['type']
+        tap.file_path = meta['file_path']
+
+    return tap
 
 def forget_tapdisk_metadata(dbg, path):
     """Delete the tapdisk metadata for this VDI from host-local storage."""
@@ -180,3 +266,52 @@ def forget_tapdisk_metadata(dbg, path):
     except:
         pass
 
+
+class TapCtl(object):
+
+    @staticmethod
+    def list(minor=None, pid=None, type_=None, file_path=None):
+        result_list = []
+        search_attributes = set()
+
+        cmd = ['tap-ctl', 'list']
+
+        if minor is not None:
+            cmd += ['-m', str(minor)]
+            search_attributes.add('minor')
+        if pid is not None:
+            cmd += ['-p', str(pid)]
+            search_attributes.add('pid')
+        if type_ is not None:
+            cmd += ['-t', str(type_)]
+            search_attributes.add('type')
+        if file_path is not None:
+            cmd += ['-f', str(file_path)]
+            search_attributes.add('file_path')
+
+        stdout = call('', cmd).rstrip().split('\n')
+        # Example return:
+        # 'pid=6068 minor=0 state=0
+        # args=vhd:/run/sr-mount/<mount_point>\n'
+        for line in stdout:
+            # pid minor state args
+            tap_dict = {}
+            for field in line.split():
+                name, value = field.split('=')
+
+                if name in ('pid', 'minor'):
+                    tap_dict[name] = int(value)
+                elif name == 'state':
+                    tap_dict[name] = int(value, 0x10)
+                elif name == 'args':
+                    args = value.split(':')
+                    tap_dict['type'] = args[0]
+                    tap_dict['file_path'] = args[1]
+
+            for attr in search_attributes:
+                if attr not in tap_dict:
+                    break
+            else:
+                result_list.append(tap_dict)
+
+        return result_list

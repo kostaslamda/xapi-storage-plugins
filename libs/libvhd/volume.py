@@ -136,7 +136,7 @@ class VHDVolume(object):
                 vol_path = cb.volumeGetPath(opq, str(vdi.vhd.id))
                 snap_vhd = db.insert_child_vhd(vdi.vhd.parent_id, vdi.vhd.vsize)
                 snap_path = cb.volumeCreate(opq, str(snap_vhd.id), vdi.vhd.vsize)
-                VHDUtil.snapshot(dbg, vol_path, snap_path)
+                VHDUtil.snapshot(dbg, snap_path, vol_path, False)
 
                 # NB. As an optimisation, "vhd-util snapshot A->B" will check if
                 #     "A" is empty. If it is, it will set "B.parent" to "A.parent"
@@ -156,7 +156,7 @@ class VHDVolume(object):
                     db.update_vhd_psize(vdi.vhd.id, cb.volumeGetPhysSize(opq, str(vdi.vhd.id)))
                     snap_2_vhd = db.insert_child_vhd(vdi.vhd.id, vdi.vhd.vsize)
                     snap_2_path = cb.volumeCreate(opq, str(snap_2_vhd.id), vdi.vhd.vsize)
-                    VHDUtil.snapshot(dbg, vol_path, snap_2_path)
+                    VHDUtil.snapshot(dbg, snap_2_path, vol_path, False)
                     db.insert_vdi(vdi.name, vdi.description, snap_uuid, snap_2_vhd.id)
         db.close()
 

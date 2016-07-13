@@ -7,7 +7,10 @@ from xapi.storage import log
 
 from .vhdutil import VHDUtil
 from .metabase import VHDMetabase
+from .intellicache import IntelliCache
 from .lock import Lock
+
+vdi_enable_intellicache = False
 
 def _parse_uri(uri):
     # uri will be like:
@@ -40,12 +43,24 @@ class VHDDatapath(object):
         db.close()
 
         vol_path = cb.volumeGetPath(opq, str(vdi.vhd.id))
+
+        if vdi.vhd.parent_id is not None and vdi_enable_intellicache:
+            parent_vhd_path = cb.volumeGetPath(opq, str(vdi.vhd.parent_id))
+            block_device = IntelliCache.attach(
+                dbg,
+                vol_path,
+                parent_vhd_path
+            )
+        else:
+            tap = tapdisk.create(dbg)
+            tapdisk.save_tapdisk_metadata(dbg, vol_path, tap)
+            block_device = tap.block_device()
+
         cb.volumeStopOperations(opq)
-        tap = tapdisk.create(dbg)
-        tapdisk.save_tapdisk_metadata(dbg, vol_path, tap)
+
         return {
             'domain_uuid': '0',
-            'implementation': ['Tapdisk3', tap.block_device()],
+            'implementation': ['Tapdisk3', block_device],
         }
 
     @staticmethod
@@ -62,9 +77,23 @@ class VHDDatapath(object):
                 db.update_vdi_active_on(vdi.uuid, this_host_label)
                 vol_path = cb.volumeGetPath(opq, str(vdi.vhd.id))
                 img = image.Vhd(vol_path)
-                tap = tapdisk.load_tapdisk_metadata(dbg, vol_path)
-                tap.open(dbg, img)
-                tapdisk.save_tapdisk_metadata(dbg, vol_path, tap)
+
+                if vdi.vhd.parent_id is not None and vdi_enable_intellicache:
+                    parent_vhd_path = cb.volumeGetPath(
+                        opq,
+                        str(vdi.vhd.parent_id)
+                    )
+
+                    IntelliCache.activate(
+                        vol_path,
+                        parent_vhd_path,
+                        vdi.nonpersistent
+                    )
+                else:
+                    tap = tapdisk.load_tapdisk_metadata(dbg, vol_path)
+                    tap.open(dbg, img)
+                    tapdisk.save_tapdisk_metadata(dbg, vol_path, tap)
+
         db.close()
         cb.volumeStopOperations(opq)
 
@@ -80,8 +109,13 @@ class VHDDatapath(object):
                 vdi = db.get_vdi_by_id(key)
                 db.update_vdi_active_on(vdi.uuid, None)
                 vol_path = cb.volumeGetPath(opq, str(vdi.vhd.id))
-                tap = tapdisk.load_tapdisk_metadata(dbg, vol_path)
-                tap.close(dbg)
+
+                if vdi.vhd.parent_id is not None and vdi_enable_intellicache:
+                    parent_vhd_path = cb.volumeGetPath(opq, str(vdi.vhd.parent_id))
+                    IntelliCache.deactivate(dbg, vol_path, parent_vhd_path)
+                else:
+                    tap = tapdisk.load_tapdisk_metadata(dbg, vol_path)
+                    tap.close(dbg)
 
         db.close()
         cb.volumeStopOperations(opq)
@@ -99,10 +133,16 @@ class VHDDatapath(object):
         db.close()
 
         vol_path = cb.volumeGetPath(opq, str(vdi.vhd.id))
+
+        if vdi.vhd.parent_id is not None and vdi_enable_intellicache:
+            parent_vhd_path = cb.volumeGetPath(opq, str(vdi.vhd.parent_id))
+            IntelliCache.detach(dbg, vol_path, parent_vhd_path)
+        else:
+            tap = tapdisk.load_tapdisk_metadata(dbg, vol_path)
+            tap.destroy(dbg)
+            tapdisk.forget_tapdisk_metadata(dbg, vol_path)
+
         cb.volumeStopOperations(opq)
-        tap = tapdisk.load_tapdisk_metadata(dbg, vol_path)
-        tap.destroy(dbg)
-        tapdisk.forget_tapdisk_metadata(dbg, vol_path)
 
     @staticmethod
     def create_single_clone(db, sr, key, cb):
@@ -188,5 +228,3 @@ class VHDDatapath(object):
             db.close()
 
         return None
-
-
