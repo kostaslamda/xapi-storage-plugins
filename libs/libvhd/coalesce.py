@@ -116,11 +116,12 @@ def non_leaf_coalesce(node, parent, uri, cb):
     VHDUtil.coalesce(GC, node_path)
 
     db = VHDMetabase(meta_path)
-    with Lock(opq, "gl", cb):
+    with Lock(opq, 'gl', cb):
         # reparent all of the children to this node's parent
         children = db.get_children(node_vhd.id)
 
-        journal_entries = db.add_journal_entries(node_vhd.id, parent_vhd.id, children)
+        with db.write_context():
+            journal_entries = db.add_journal_entries(node_vhd.id, parent_vhd.id, children)
 
         # log.debug("List of children: %s" % children)
         for child in journal_entries:
@@ -130,9 +131,6 @@ def non_leaf_coalesce(node, parent, uri, cb):
             leaves = []
             find_leaves(db.get_vhd_by_id(child.id), db, leaves)
 
-            # Add leaves to database
-            leaves_to_refresh = db.add_refresh_entries(child.id, leaves)
-
             # reparent child to grandparent
             log.debug("Reparenting {} to {}".format(child.id, child.new_parent_id))
             with db.write_context():
@@ -140,6 +138,8 @@ def non_leaf_coalesce(node, parent, uri, cb):
                 new_parent_path = cb.volumeGetPath(opq, str(child.new_parent_id))
                 VHDUtil.set_parent(GC, child_path, new_parent_path)
                 db.remove_journal_entry(child.id)
+                # Add leaves to database
+                leaves_to_refresh = db.add_refresh_entries(child.id, leaves)
 
             # Refresh all leaves having child as an ancestor
             log.debug(
@@ -147,7 +147,9 @@ def non_leaf_coalesce(node, parent, uri, cb):
                  "leaves: {}").format(child.id, leaves_to_refresh))
             for leaf in leaves_to_refresh:
                 with db.write_context():
-                    tap_ctl_refresh(db.get_vdi_for_vhd(leaf.leaf_id), cb, opq)
+                    vdi = db.get_vdi_for_vhd(leaf.leaf_id)
+                    if vdi:
+                        tap_ctl_refresh(vdi, cb, opq)
                     db.remove_refresh_entry(leaf.leaf_id)
 
         # remove key
