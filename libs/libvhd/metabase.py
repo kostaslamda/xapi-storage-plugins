@@ -128,9 +128,7 @@ class VHDMetabase(object):
             self._conn.execute("""
                  CREATE TABLE refresh(
                      id         INTEGER NOT NULL,
-                     leaf_id    INTEGER NOT NULL,
-                     FOREIGN KEY(id) REFERENCES vhd(id),
-                     FOREIGN KEY(leaf_id) REFERENCES vhd(id)
+                     leaf_id    INTEGER NOT NULL
                  )"""
             )
 
