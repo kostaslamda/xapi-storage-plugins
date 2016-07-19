@@ -484,3 +484,166 @@ class VHDCoalesceTest(unittest.TestCase):
             [mock.call(4), mock.call(5)],
             any_order=True)
         self.assertEquals(2, mockDB.delete_vhd.call_count)
+
+    @mock.patch('xapi.storage.libs.libvhd.coalesce.VHDMetabase')
+    @mock.patch('xapi.storage.libs.libvhd.coalesce.poolhelper')
+    @mock.patch('xapi.storage.libs.libvhd.coalesce.Lock')
+    def test_recover_noop_success(self, mocklock, mockPoolHelper, mockMetabase):
+         # Setup some mocks
+        callbacks = mock.MagicMock()
+        mockDB = mock.MagicMock()
+        mockMetabase.return_value = mockDB
+        mockDB.write_context.side_effect = test_context
+
+        mockDB.get_refresh_entries.side_effect = [ [] ]
+
+        coalesce.recover_journal("test-uri", callbacks)
+
+        self.assertEquals(1, mockDB.get_refresh_entries.call_count)
+        mockPoolHelper.suspend_datapath_on_host.assert_not_called()
+        mockPoolHelper.resume_datapath_on_host.assert_not_called()
+        mockPoolHelper.refresh_datapath_on_host.assert_not_called()
+
+
+    @mock.patch('xapi.storage.libs.libvhd.coalesce.VHDMetabase')
+    @mock.patch('xapi.storage.libs.libvhd.coalesce.poolhelper')
+    @mock.patch('xapi.storage.libs.libvhd.coalesce.log')
+    @mock.patch('xapi.storage.libs.libvhd.coalesce.Lock')
+    def test_recover_one_refresh_active_success(
+        self,
+        mocklock,
+        mocklog,
+        mockPoolHelper,
+        mockMetabase):
+
+         # Setup some mocks
+        callbacks = mock.MagicMock()
+        mockDB = mock.MagicMock()
+        mockMetabase.return_value = mockDB
+        mockDB.write_context.side_effect = test_context
+
+        mockDB.get_refresh_entries.side_effect = [ [ Refresh(4, 4) ] ]
+
+        # This is the leaf VHD
+        leaf_vhd = VHD(
+                    4,
+                    3,
+                    0,
+                    10*1024,
+                    10*1024
+                    )
+
+        # This is the VDI for the leaf VHD
+        mockDB.get_vdi_for_vhd.return_value = VDI(
+            "1", "VDI1", "", "Host1", None, leaf_vhd)
+
+        coalesce.recover_journal("test-uri", callbacks)
+
+        self.assertEquals(1, mockDB.get_refresh_entries.call_count)
+        mockDB.remove_refresh_entry.assert_has_calls([mock.call(4)])
+        self.assertEquals(1, mockDB.remove_refresh_entry.call_count)
+        mockPoolHelper.suspend_datapath_on_host.assert_not_called()
+        mockPoolHelper.resume_datapath_on_host.assert_not_called()
+        mockPoolHelper.refresh_datapath_on_host.assert_called_with("GC", "Host1", mock.ANY, mock.ANY)
+
+    @mock.patch('xapi.storage.libs.libvhd.coalesce.VHDMetabase')
+    @mock.patch('xapi.storage.libs.libvhd.coalesce.poolhelper')
+    @mock.patch('xapi.storage.libs.libvhd.coalesce.log')
+    @mock.patch('xapi.storage.libs.libvhd.coalesce.Lock')
+    def test_recover_one_refresh_vdi_missing_success(
+        self,
+        mocklock,
+        mocklog,
+        mockPoolHelper,
+        mockMetabase):
+
+        """ This allows for a VDI to have been deleted in the period between
+        a coalesce abort and the recovery operation picking up the pieces.
+        """
+
+         # Setup some mocks
+        callbacks = mock.MagicMock()
+        mockDB = mock.MagicMock()
+        mockMetabase.return_value = mockDB
+        mockDB.write_context.side_effect = test_context
+
+        mockDB.get_refresh_entries.side_effect = [ [ Refresh(4, 4) ] ]
+
+        # This is the leaf VHD
+        leaf_vhd = VHD(
+                    4,
+                    3,
+                    0,
+                    10*1024,
+                    10*1024
+                    )
+
+        # This is the VDI for the leaf VHD
+        mockDB.get_vdi_for_vhd.return_value = None
+
+        coalesce.recover_journal("test-uri", callbacks)
+
+        self.assertEquals(1, mockDB.get_refresh_entries.call_count)
+        mockDB.remove_refresh_entry.assert_has_calls([mock.call(4)])
+        self.assertEquals(1, mockDB.remove_refresh_entry.call_count)
+        mockPoolHelper.suspend_datapath_on_host.assert_not_called()
+        mockPoolHelper.resume_datapath_on_host.assert_not_called()
+        mockPoolHelper.refresh_datapath_on_host.assert_not_called()
+
+    @mock.patch('xapi.storage.libs.libvhd.coalesce.VHDMetabase')
+    @mock.patch('xapi.storage.libs.libvhd.coalesce.VHDUtil.set_parent')
+    @mock.patch('xapi.storage.libs.libvhd.coalesce.poolhelper')
+    @mock.patch('xapi.storage.libs.libvhd.coalesce.log')
+    @mock.patch('xapi.storage.libs.libvhd.coalesce.Lock')
+    def test_recover_one_journal_success_active(
+        self,
+        mocklock,
+            mocklog,
+            mockPoolHelper,
+            mock_vhdutil_set_parent,
+            mockMetabase):
+
+        # Setup some mocks
+        callbacks = mock.MagicMock()
+        mockDB = mock.MagicMock()
+        mockMetabase.return_value = mockDB
+        mockDB.write_context.side_effect = test_context
+        # This is the leaf VHD
+        leaf_vhd = VHD(
+                    4,
+                    3,
+                    0,
+                    10*1024,
+                    10*1024
+                    )
+
+        mockDB.get_children.side_effect = [           
+                [leaf_vhd],
+                []
+            ]
+        mockDB.get_vhd_by_id.side_effect = [leaf_vhd]
+
+        # This is the VDI for the leaf VHD
+        mockDB.get_vdi_for_vhd.return_value = VDI("1", "VDI1", "", "Host1", None, leaf_vhd)
+
+        mockDB.add_refresh_entries.side_effect =  [
+            [ Refresh(4, 4) ]
+            ]
+        mockDB.get_journal_entries.side_effect = [ 
+            [ Journal(4, 3, 2) ]
+            ]
+
+        coalesce.recover_journal("test-uri", callbacks)
+
+        self.assertEquals(1, mockDB.get_journal_entries.call_count)
+        mock_vhdutil_set_parent.assert_called()
+        mockDB.update_vhd_parent.assert_called_with(4, 2)
+        mockDB.add_refresh_entries.assert_has_calls([mock.call(4, [leaf_vhd])])
+        self.assertEquals(1, mockDB.add_refresh_entries.call_count)
+        mockDB.remove_journal_entry.assert_has_calls([mock.call(4)])
+        self.assertEquals(1, mockDB.remove_journal_entry.call_count)
+        mockDB.remove_refresh_entry.assert_has_calls([mock.call(4)])
+        self.assertEquals(1, mockDB.remove_refresh_entry.call_count)
+        mockPoolHelper.suspend_datapath_on_host.assert_not_called()
+        mockPoolHelper.resume_datapath_on_host.assert_not_called()
+        mockPoolHelper.refresh_datapath_on_host.assert_called_with("GC", "Host1", mock.ANY, mock.ANY)

@@ -49,6 +49,38 @@ def get_sr_callbacks(sr_type):
     mod = importlib.import_module(sr_type)
     return mod.Callbacks()
 
+def __refresh_leaf_vdis(opq, db, cb, leaves):
+    for leaf in leaves:
+        with db.write_context():
+            vdi = db.get_vdi_for_vhd(leaf.leaf_id)
+            if vdi:
+                tap_ctl_refresh(vdi, cb, opq)
+            db.remove_refresh_entry(leaf.leaf_id)
+
+def __reparent_children(opq, db, cb, journal_entries):
+    for child in journal_entries:
+        child_path = cb.volumeGetPath(opq, str(child.id))
+
+        # Find all leaves having child as an ancestor
+        leaves = []
+        find_leaves(db.get_vhd_by_id(child.id), db, leaves)
+
+        # reparent child to grandparent
+        log.debug("Reparenting {} to {}".format(child.id, child.new_parent_id))
+        with db.write_context():
+            db.update_vhd_parent(child.id, child.new_parent_id)
+            new_parent_path = cb.volumeGetPath(opq, str(child.new_parent_id))
+            VHDUtil.set_parent(GC, child_path, new_parent_path)
+            db.remove_journal_entry(child.id)
+            # Add leaves to database
+            leaves_to_refresh = db.add_refresh_entries(child.id, leaves)
+
+        # Refresh all leaves having child as an ancestor
+        log.debug(
+            ("Children {}: refreshing all "
+             "leaves: {}").format(child.id, leaves_to_refresh))
+        __refresh_leaf_vdis(opq, db, cb, leaves_to_refresh)
+
 def find_non_leaf_coalesceable(db):
     results = db.find_non_leaf_coalesceable()
     if len(results) > 0:
@@ -123,34 +155,7 @@ def non_leaf_coalesce(node, parent, uri, cb):
         with db.write_context():
             journal_entries = db.add_journal_entries(node_vhd.id, parent_vhd.id, children)
 
-        # log.debug("List of children: %s" % children)
-        for child in journal_entries:
-            child_path = cb.volumeGetPath(opq, str(child.id))
-
-            # Find all leaves having child as an ancestor
-            leaves = []
-            find_leaves(db.get_vhd_by_id(child.id), db, leaves)
-
-            # reparent child to grandparent
-            log.debug("Reparenting {} to {}".format(child.id, child.new_parent_id))
-            with db.write_context():
-                db.update_vhd_parent(child.id, child.new_parent_id)
-                new_parent_path = cb.volumeGetPath(opq, str(child.new_parent_id))
-                VHDUtil.set_parent(GC, child_path, new_parent_path)
-                db.remove_journal_entry(child.id)
-                # Add leaves to database
-                leaves_to_refresh = db.add_refresh_entries(child.id, leaves)
-
-            # Refresh all leaves having child as an ancestor
-            log.debug(
-                ("Children {}: refreshing all "
-                 "leaves: {}").format(child.id, leaves_to_refresh))
-            for leaf in leaves_to_refresh:
-                with db.write_context():
-                    vdi = db.get_vdi_for_vhd(leaf.leaf_id)
-                    if vdi:
-                        tap_ctl_refresh(vdi, cb, opq)
-                    db.remove_refresh_entry(leaf.leaf_id)
+        __reparent_children(opq, db, cb, journal_entries)
 
         # remove key
         log.debug("Destroy {}".format(node_vhd.id))
@@ -230,6 +235,24 @@ def find_best_non_leaf_coalesceable_2(uri, cb):
     cb.volumeStopOperations(opq)
     return ret
 
+def recover_journal(uri, cb):
+    opq = cb.volumeStartOperations(uri, 'w')
+    meta_path = cb.volumeMetadataGetPath(opq)
+    db = VHDMetabase(meta_path)
+
+    # Take the global SR lock, the coaleasce reparenting happens within this
+    # lock, so if we can get it and if there are any pending operations then
+    # a different process crashed or was aborted and we need to complete
+    # the outstanding operations
+    with Lock(opq, 'gl', cb):
+        # First get any leaf VDIs that need a tap refresh
+        refresh_entries = db.get_refresh_entries()
+        __refresh_leaf_vdis(opq, db, cb, refresh_entries)
+
+        # Now get the journalled reparent operations
+        journal_entries = db.get_journal_entries()
+        __reparent_children(opq, db, cb, journal_entries)
+
 def remove_garbage_vhds(uri, cb):
     opq = cb.volumeStartOperations(uri, 'w')
     meta_path = cb.volumeMetadataGetPath(opq)
@@ -269,6 +292,8 @@ def run_coalesce(sr_type, uri):
 
     while True:
         remove_garbage_vhds(uri, cb)
+
+        recover_journal(uri, cb)
 
         child, parent = find_best_non_leaf_coalesceable_2(uri, cb)
         if (child, parent) != (None, None):
