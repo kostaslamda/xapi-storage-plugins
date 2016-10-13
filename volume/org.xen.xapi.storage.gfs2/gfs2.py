@@ -86,7 +86,7 @@ class Callbacks():
     def volumeUnlock(self, opq, lock):
         log.debug("volumeUnlock opq=%s" % opq)
         fcntl.flock(lock, fcntl.LOCK_UN)
-        lock.close
+        lock.close()
     def volumeTryLock(self, opq, name):
         try:
             log.debug("volumeLock opq=%s name=%s" % (opq, name))
