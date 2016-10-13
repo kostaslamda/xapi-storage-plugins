@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 
-from __future__ import absolute_import
+from __future__ import absolute_import, division
 import subprocess
 import importlib
 import os
@@ -18,6 +18,9 @@ from xapi.storage.libs.libvhd.lock import Lock
 
 # Debug string
 GC = 'GC'
+
+_MiB = 2**20
+_LEAF_COALESCE_MAX_SIZE = 20 * _MiB
 
 class VhdLock:
     def __init__(self, vhd, lock):
@@ -54,7 +57,7 @@ def __refresh_leaf_vdis(opq, db, cb, leaves):
         with db.write_context():
             vdi = db.get_vdi_for_vhd(leaf.leaf_id)
             if vdi:
-                tap_ctl_refresh(vdi, cb, opq)
+                tap_ctl_refresh(cb, opq, vdi)
             db.remove_refresh_entry(leaf.leaf_id)
 
 def __reparent_children(opq, db, cb, journal_entries):
@@ -87,12 +90,11 @@ def find_non_leaf_coalesceable(db):
         log.debug("Found {} non leaf coalescable nodes".format(len(results)))
     return results
 
-#def find_leaf_coalesceable(db):
-#    results = db.find_leaf_coalesceable()
-#    for row in results:
-#        log.debug("%s" % str(row))
-#    log.debug("Found %s leaf coalescable nodes" % len(results))
-#    return results
+def find_leaf_coalesceable(db):
+    results = db.find_leaf_coalesceable()
+    if len(results) > 0:
+        log.debug("Found {} leaf coalescable nodes".format(len(results)))
+    return results
 
 def find_leaves(vhd, db, leaf_accumulator):
     children = db.get_children(vhd.id)
@@ -103,11 +105,23 @@ def find_leaves(vhd, db, leaf_accumulator):
         for child in children:
             find_leaves(child, db, leaf_accumulator)
 
-def tap_ctl_refresh(node, cb, opq):
-    if node.active_on:
-        node_path = cb.volumeGetPath(opq, str(node.vhd.id))
-        log.debug("VHD {} active on {}".format(node.vhd.id, node.active_on))
-        poolhelper.refresh_datapath_on_host(GC, node.active_on, node_path, node_path)
+def tap_ctl_refresh(cb, opq, vdi, new_vhd_path=''):
+    if not vdi.active_on:
+        return
+
+    log.debug("VHD {} active on {}".format(vdi.vhd.id, vdi.active_on))
+
+    vhd_path = cb.volumeGetPath(opq, str(vdi.vhd.id))
+
+    if new_vhd_path == '':
+        new_vhd_path = vhd_path
+
+    poolhelper.refresh_datapath_on_host(
+        GC,
+        vdi.active_on,
+        vhd_path,
+        new_vhd_path
+    )
 
 # def leaf_coalesce_snapshot(key, conn, cb, opq):
 #     log.debug("leaf_coalesce_snapshot key=%s" % key)
@@ -133,6 +147,88 @@ def tap_ctl_refresh(node, cb, opq):
 #     conn.commit()
 
 #     tap_ctl_unpause(key, conn, cb, opq)
+
+def leaf_coalesce(leaf, parent, uri, cb):
+    leaf_vhd = leaf.vhd
+    parent_vhd = parent.vhd
+
+    log.debug(
+        'leaf_coalesce key={}, parent={}'.format(leaf_vhd.id, parent_vhd.id)
+    )
+
+    opq = cb.volumeStartOperations(uri, 'w')
+    meta_path = cb.volumeMetadataGetPath(opq)
+
+    leaf_path = cb.volumeGetPath(opq, str(leaf_vhd.id))
+    leaf_psize = os.path.getsize(leaf_path)
+
+    db = VHDMetabase(meta_path)
+    with Lock(opq, 'gl', cb):
+        if leaf_psize < _LEAF_COALESCE_MAX_SIZE:
+            log.debug("Running leaf-coalesce on {}".format(leaf_vhd.id))
+
+            with db.write_context():
+                vdi = db.get_vdi_for_vhd(leaf_vhd.id)
+
+                if vdi.active_on is not None:
+                    poolhelper.suspend_datapath_on_host(
+                        GC,
+                        vdi.active_on,
+                        leaf_path
+                    )
+
+                VHDUtil.coalesce(GC, leaf_path)
+
+                db.update_vdi_vhd_id(vdi.uuid, leaf_vhd.parent_id)
+                db.delete_vhd(leaf_vhd.id)
+
+                if vdi.active_on is not None:
+                    parent_path = cb.volumeGetPath(opq, str(parent_vhd.id))
+                    poolhelper.resume_datapath_on_host(
+                        GC,
+                        vdi.active_on,
+                        leaf_path,
+                        parent_path
+                    )
+
+                cb.volumeDestroy(opq, str(leaf_vhd.id))
+        else:
+            # If the leaf is larger than the maximum size allowed for
+            # a live leaf coalesce to happen, snapshot it and let
+            # non_leaf_coalesce() take care of it.
+
+            log.debug(
+                "Snapshot {} and let non-leaf-coalesce handle it".format(
+                    leaf_vhd.id
+                )
+            )
+
+            with db.write_context():
+                vdi = db.get_vdi_for_vhd(leaf_vhd.id)
+
+                new_leaf_vhd = db.insert_child_vhd(
+                    leaf_vhd.id,
+                    leaf_vhd.vsize
+                )
+
+                new_leaf_path = cb.volumeCreate(
+                    opq,
+                    str(new_leaf_vhd.id),
+                    leaf_vhd.vsize
+                )
+
+                VHDUtil.snapshot(GC, new_leaf_path, leaf_path, False)
+
+                db.update_vdi_vhd_id(vdi.uuid, new_leaf_vhd.id)
+
+            # 'vdi' object here still points to the old 'vhd.id'
+            tap_ctl_refresh(cb, opq, vdi, new_leaf_path)
+
+        cb.volumeUnlock(opq, leaf.lock)
+        cb.volumeUnlock(opq, parent.lock)
+
+    db.close()
+    cb.volumeStopOperations(opq)
 
 def non_leaf_coalesce(node, parent, uri, cb):
     node_vhd = node.vhd
@@ -235,6 +331,28 @@ def find_best_non_leaf_coalesceable_2(uri, cb):
     cb.volumeStopOperations(opq)
     return ret
 
+def find_best_leaf_coalesceable(uri, cb):
+    opq = cb.volumeStartOperations(uri, 'w')
+    meta_path = cb.volumeMetadataGetPath(opq)
+    db = VHDMetabase(meta_path)
+
+    ret = (None, None)
+    with Lock(opq, 'gl', cb):
+        nodes = find_leaf_coalesceable(db)
+        for node in nodes:
+            parent_lock = cb.volumeTryLock(opq, __create_vhd_lock_name(node.parent_id))
+            if parent_lock:
+                node_lock = cb.volumeTryLock(opq, __create_vhd_lock_name(node.id))
+                if node_lock:
+                    parent = db.get_vhd_by_id(node.parent_id)
+                    ret = (VhdLock(node, node_lock), VhdLock(parent, parent_lock))
+                    break
+                else:
+                    cb.volumeUnlock(opq, parent_lock)
+    db.close()
+    cb.volumeStopOperations(opq)
+    return ret
+
 def recover_journal(uri, cb):
     opq = cb.volumeStartOperations(uri, 'w')
     meta_path = cb.volumeMetadataGetPath(opq)
@@ -260,6 +378,7 @@ def remove_garbage_vhds(uri, cb):
 
     garbage = db.get_garbage_vhds()
 
+    # XXX: Redundant check
     if len(garbage) > 0:
         for vhd in garbage:
             cb.volumeDestroy(opq, str(vhd.id))
@@ -298,6 +417,11 @@ def run_coalesce(sr_type, uri):
         child, parent = find_best_non_leaf_coalesceable_2(uri, cb)
         if (child, parent) != (None, None):
             non_leaf_coalesce(child, parent, uri, cb)
+            continue
+
+        child, parent = find_best_leaf_coalesceable(uri, cb)
+        if child is not None and parent is not None:
+            leaf_coalesce(child, parent, uri, cb)
         else:
             for i in range(10):
                 if not os.path.exists(gc_running):

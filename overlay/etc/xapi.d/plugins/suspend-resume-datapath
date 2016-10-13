@@ -34,7 +34,12 @@ def resume_datapath(session, args):
     tap = tapdisk.find_by_file(dbg, image.Path(args['path']))
     if tap:
         log.debug("%s: found a tapdisk to unpause: %s" % (dbg, tap))
-        tap.unpause(dbg)
+        tap.unpause(dbg, image.Vhd(args['new_path']))
+
+        if args['path'] != args['new_path']:
+            tapdisk.forget_tapdisk_metadata(dbg, args['path'])
+            tapdisk.save_tapdisk_metadata(dbg, args['new_path'], tap)
+
     log.debug("%s: resume_datapath returning True" % (dbg))
     return "True"
 
